@@ -19,6 +19,7 @@ instead. See: go/pandas-gbq-and-bigframes-redundancy and
 https://github.com/googleapis/python-bigquery-pandas/blob/main/pandas_gbq/schema/pandas_to_bigquery.py
 """
 
+import base64
 import concurrent.futures
 from datetime import datetime
 import functools
@@ -741,6 +742,46 @@ def _row_iterator_page_to_arrow(page, column_names, arrow_types):
     return pyarrow.RecordBatch.from_arrays(arrays, names=column_names)
 
 
+def _deserialize_arrow_record_batch(
+    serialized_batch, serialized_schema=None, bq_schema=None
+):
+    """Deserialize base64 or bytes Arrow RecordBatch from BigQuery API response."""
+    if pyarrow is None:
+        raise ValueError("pyarrow library is required.")
+
+    if isinstance(serialized_batch, str):
+        raw_bytes = base64.b64decode(serialized_batch)
+    else:
+        raw_bytes = bytes(serialized_batch)
+
+    # Try reading as an Arrow IPC stream
+    try:
+        reader = pyarrow.ipc.open_stream(raw_bytes)
+        batches = list(reader)
+        if batches:
+            if len(batches) == 1:
+                return batches[0]
+            return pyarrow.Table.from_batches(batches).combine_chunks().to_batches()[0]
+    except Exception:
+        pass
+
+    # Fall back to reading record batch with explicit schema
+    pa_schema = None
+    if serialized_schema is not None:
+        if isinstance(serialized_schema, str):
+            schema_bytes = base64.b64decode(serialized_schema)
+        else:
+            schema_bytes = bytes(serialized_schema)
+        pa_schema = pyarrow.ipc.read_schema(pyarrow.py_buffer(schema_bytes))
+    elif bq_schema is not None:
+        pa_schema = bq_to_arrow_schema(bq_schema)
+
+    if pa_schema is not None:
+        return pyarrow.ipc.read_record_batch(pyarrow.py_buffer(raw_bytes), pa_schema)
+
+    raise ValueError("Could not deserialize Arrow record batch from response.")
+
+
 def download_arrow_row_iterator(pages, bq_schema, timeout=None):
     """Use HTTP JSON RowIterator to construct an iterable of RecordBatches.
 
@@ -764,16 +805,21 @@ def download_arrow_row_iterator(pages, bq_schema, timeout=None):
     column_names = bq_to_arrow_schema(bq_schema) or [field.name for field in bq_schema]
     arrow_types = [bq_to_arrow_data_type(field) for field in bq_schema]
 
+    def _page_to_arrow(page):
+        if getattr(page, "_record_batch", None) is not None:
+            return page._record_batch
+        return _row_iterator_page_to_arrow(page, column_names, arrow_types)
+
     if timeout is None:
         for page in pages:
-            yield _row_iterator_page_to_arrow(page, column_names, arrow_types)
+            yield _page_to_arrow(page)
     else:
         start_time = time.monotonic()
         for page in pages:
             if time.monotonic() - start_time > timeout:
                 raise concurrent.futures.TimeoutError()
 
-            yield _row_iterator_page_to_arrow(page, column_names, arrow_types)
+            yield _page_to_arrow(page)
 
 
 def _row_iterator_page_to_dataframe(page, column_names, dtypes):
@@ -816,16 +862,21 @@ def download_dataframe_row_iterator(pages, bq_schema, dtypes, timeout=None):
     bq_schema = schema._to_schema_fields(bq_schema)
     column_names = [field.name for field in bq_schema]
 
+    def _page_to_dataframe(page):
+        if getattr(page, "_record_batch", None) is not None:
+            return page._record_batch.to_pandas()
+        return _row_iterator_page_to_dataframe(page, column_names, dtypes)
+
     if timeout is None:
         for page in pages:
-            yield _row_iterator_page_to_dataframe(page, column_names, dtypes)
+            yield _page_to_dataframe(page)
     else:
         start_time = time.monotonic()
         for page in pages:
             if time.monotonic() - start_time > timeout:
                 raise concurrent.futures.TimeoutError()
 
-            yield _row_iterator_page_to_dataframe(page, column_names, dtypes)
+            yield _page_to_dataframe(page)
 
 
 def _bqstorage_page_to_arrow(page):

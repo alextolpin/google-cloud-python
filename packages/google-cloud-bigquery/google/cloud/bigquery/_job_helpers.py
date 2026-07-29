@@ -500,6 +500,14 @@ def query_and_wait(
         query=query, job_config=job_config, location=location, timeout=api_timeout
     )
 
+    import os
+
+    if os.getenv("BIGQUERY_READ_ROWS_FROM_JOB_ID", "").lower() in ("true", "1"):
+        request_body["queryResultsFormat"] = "ARROW"
+        request_body.setdefault("arrowSerializationOptions", {})[
+            "bufferCompression"
+        ] = "LZ4_FRAME"
+
     # Some API parameters aren't supported by the jobs.query API. In these
     # cases, fallback to a jobs.insert call.
     if not _supported_by_jobs_query(request_body):
@@ -673,6 +681,8 @@ def _supported_by_jobs_query(request_body: Dict[str, Any]) -> bool:
         "jobTimeoutMs",
         "reservation",
         "maxSlots",
+        "queryResultsFormat",
+        "arrowSerializationOptions",
     }
 
     unsupported_keys = request_keys - keys_allowlist

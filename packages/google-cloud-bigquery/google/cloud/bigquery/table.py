@@ -2051,6 +2051,17 @@ class RowIterator(HTTPIterator):
 
         return False
 
+    def _use_readrows_from_job_id(self) -> bool:
+        """Helper to check if BIGQUERY_READ_ROWS_FROM_JOB_ID is enabled and required job properties exist."""
+        import os
+
+        return (
+            os.getenv("BIGQUERY_READ_ROWS_FROM_JOB_ID", "").lower() in ("true", "1")
+            and bool(self.job_id)
+            and bool(self.location)
+            and bool(self.project)
+        )
+
     def _should_use_bqstorage(self, bqstorage_client, create_bqstorage_client):
         """Returns True if the BigQuery Storage API can be used.
 
@@ -2062,7 +2073,9 @@ class RowIterator(HTTPIterator):
         if not using_bqstorage_api:
             return False
 
-        if self._table is None:
+        use_readrows_job = self._use_readrows_from_job_id()
+
+        if not use_readrows_job and self._table is None:
             return False
 
         # The developer has already started paging through results if
@@ -2073,18 +2086,25 @@ class RowIterator(HTTPIterator):
         if self._is_almost_completely_cached():
             return False
 
-        if self.max_results is not None:
+        if not use_readrows_job and self.max_results is not None:
             return False
 
         try:
             _versions_helpers.BQ_STORAGE_VERSIONS.try_import(raise_if_error=True)
         except bq_exceptions.BigQueryStorageNotFoundError:
+            if use_readrows_job:
+                raise ValueError(
+                    "google-cloud-bigquery-storage is required when "
+                    "BIGQUERY_READ_ROWS_FROM_JOB_ID is enabled."
+                )
             warnings.warn(
                 "BigQuery Storage module not found, fetch data with the REST "
                 "endpoint instead."
             )
             return False
         except bq_exceptions.LegacyBigQueryStorageError as exc:
+            if use_readrows_job:
+                raise ValueError(str(exc))
             warnings.warn(str(exc))
             return False
 
@@ -2104,6 +2124,17 @@ class RowIterator(HTTPIterator):
             response = {
                 self._items_key: rows,
             }
+            for key in (
+                "serializedRecordBatch",
+                "serialized_record_batch",
+                "serializedSchema",
+                "serialized_schema",
+                "queryResultsFormat",
+                "query_results_format",
+            ):
+                if key in self._first_page_response:
+                    response[key] = self._first_page_response[key]
+
             if self._next_token in self._first_page_response:
                 response[self._next_token] = self._first_page_response[self._next_token]
 
@@ -2150,6 +2181,9 @@ class RowIterator(HTTPIterator):
             bqstorage_client:
                 The BigQuery Storage client intended to use for downloading result rows.
         """
+        if self._use_readrows_from_job_id():
+            return
+
         if bqstorage_client is not None and self.max_results is not None:
             warnings.warn(
                 "Cannot use bqstorage_client if max_results is set, "
@@ -2228,17 +2262,27 @@ class RowIterator(HTTPIterator):
         """
         self._maybe_warn_max_results(bqstorage_client)
 
-        bqstorage_download = functools.partial(
-            _pandas_helpers.download_arrow_bqstorage,
-            self._billing_project,
-            self._table,
-            bqstorage_client,
-            preserve_order=self._preserve_order,
-            selected_fields=self._selected_fields,
-            max_queue_size=max_queue_size,
-            max_stream_count=max_stream_count,
-            timeout=timeout,
-        )
+        if self._use_readrows_from_job_id():
+            if pyarrow is None:
+                raise ValueError(_NO_PYARROW_ERROR)
+            bqstorage_download = functools.partial(
+                self._download_arrow_readrows_from_job,
+                bqstorage_client,
+                timeout=timeout,
+            )
+        else:
+            bqstorage_download = functools.partial(
+                _pandas_helpers.download_arrow_bqstorage,
+                self._billing_project,
+                self._table,
+                bqstorage_client,
+                preserve_order=self._preserve_order,
+                selected_fields=self._selected_fields,
+                max_queue_size=max_queue_size,
+                max_stream_count=max_stream_count,
+                timeout=timeout,
+            )
+
         tabledata_list_download = functools.partial(
             _pandas_helpers.download_arrow_row_iterator,
             iter(self.pages),
@@ -2250,6 +2294,84 @@ class RowIterator(HTTPIterator):
             tabledata_list_download,
             bqstorage_client=bqstorage_client,
         )
+
+    def _download_arrow_readrows_from_job(
+        self,
+        bqstorage_client: Optional[
+            "google.cloud.bigquery_storage.BigQueryReadClient"
+        ] = None,
+        timeout: Optional[float] = None,
+    ) -> Iterator["pyarrow.RecordBatch"]:
+        from google.cloud import bigquery_storage_v1
+        from google.cloud.bigquery_storage_v1.services.big_query_read.client import (
+            BigQueryReadClient as GapicClient,
+        )
+
+        if bqstorage_client is None:
+            from google.cloud.bigquery_storage_v1.services.big_query_read.transports import (
+                BigQueryReadGrpcTransport,
+            )
+
+            options = [
+                ("grpc.max_receive_message_length", 128 * 1024 * 1024),
+                ("grpc.keepalive_time_ms", 30000),
+            ]
+            transport = BigQueryReadGrpcTransport(
+                credentials=self.client._credentials,
+                options=options,
+            )
+            bqstorage_client = bigquery_storage_v1.BigQueryReadClient(
+                transport=transport
+            )
+
+        if bqstorage_client is None:
+            raise ValueError("Failed to create BigQuery Storage client.")
+
+        stream_name = f"projects/{self._project}/locations/{self._location}/jobs/{self._job_id}/streams/_default"
+
+        request = bigquery_storage_v1.types.ReadRowsRequest(
+            read_stream=stream_name,
+            offset=0,
+        )
+
+        response_stream = GapicClient.read_rows(
+            bqstorage_client, request=request, timeout=timeout
+        )
+
+        pa_schema = None
+        yielded_rows = 0
+
+        for chunk in response_stream:
+            if (
+                chunk.arrow_schema
+                and chunk.arrow_schema.serialized_schema
+                and pa_schema is None
+            ):
+                pa_schema = pyarrow.ipc.read_schema(
+                    pyarrow.py_buffer(chunk.arrow_schema.serialized_schema)
+                )
+
+            if (
+                chunk.arrow_record_batch
+                and chunk.arrow_record_batch.serialized_record_batch
+            ):
+                if pa_schema is None:
+                    continue
+                record_batch = pyarrow.ipc.read_record_batch(
+                    pyarrow.py_buffer(chunk.arrow_record_batch.serialized_record_batch),
+                    pa_schema,
+                )
+
+                if self.max_results is not None:
+                    if yielded_rows + record_batch.num_rows >= self.max_results:
+                        remaining = self.max_results - yielded_rows
+                        if remaining > 0:
+                            record_batch = record_batch.slice(0, remaining)
+                            yield record_batch
+                        break
+                    yielded_rows += record_batch.num_rows
+
+                yield record_batch
 
     # If changing the signature of this method, make sure to apply the same
     # changes to job.QueryJob.to_arrow()
@@ -3862,7 +3984,7 @@ class BigLakeConfiguration(object):
 
 
 def _item_to_row(iterator, resource):
-    """Convert a JSON row to the native object.
+    """Convert a JSON or tuple row to the native object.
 
     .. note::
 
@@ -3872,11 +3994,15 @@ def _item_to_row(iterator, resource):
 
     Args:
         iterator (google.api_core.page_iterator.Iterator): The iterator that is currently in use.
-        resource (Dict): An item to be converted to a row.
+        resource (Dict or Tuple or Row): An item to be converted to a row.
 
     Returns:
         google.cloud.bigquery.table.Row: The next row in the page.
     """
+    if isinstance(resource, Row):
+        return resource
+    if isinstance(resource, (tuple, list)):
+        return Row(tuple(resource), iterator._field_to_index)
     return Row(
         _helpers._row_tuple_from_json(resource, iterator.schema),
         iterator._field_to_index,
@@ -3913,9 +4039,43 @@ def _rows_page_start(iterator, page, response):
         page (google.api_core.page_iterator.Page): The page that was just created.
         response (Dict): The JSON API response for a page of rows in a table.
     """
-    # Make a (lazy) copy of the page in column-oriented format for use in data
-    # science packages.
-    page._columns = _row_iterator_page_columns(iterator._schema, response)
+    serialized_batch = response.get("serializedRecordBatch") or response.get(
+        "serialized_record_batch"
+    )
+    if serialized_batch:
+        from google.cloud.bigquery import _pandas_helpers
+
+        serialized_schema = response.get("serializedSchema") or response.get(
+            "serialized_schema"
+        )
+        if serialized_schema:
+            iterator._last_serialized_schema = serialized_schema
+        else:
+            serialized_schema = getattr(iterator, "_last_serialized_schema", None)
+        record_batch = _pandas_helpers._deserialize_arrow_record_batch(
+            serialized_batch,
+            serialized_schema=serialized_schema,
+            bq_schema=iterator._schema,
+        )
+        page._record_batch = record_batch
+        page._columns = tuple(
+            record_batch.column(i).to_pylist() for i in range(record_batch.num_columns)
+        )
+        row_tuples = list(
+            zip(
+                *(
+                    record_batch.column(i).to_pylist()
+                    for i in range(record_batch.num_columns)
+                )
+            )
+        )
+        page._items = row_tuples
+        page._num_items = len(row_tuples)
+        page._remaining = len(row_tuples)
+        page._item_iter = iter(row_tuples)
+    else:
+        page._record_batch = None
+        page._columns = _row_iterator_page_columns(iterator._schema, response)
 
     total_rows = response.get("totalRows")
     # Don't reset total_rows if it's not present in the next API response.

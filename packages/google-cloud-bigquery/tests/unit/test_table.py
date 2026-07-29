@@ -6918,3 +6918,244 @@ def test_to_dataframe_iterable_w_bqstorage_max_stream_count(preserve_order):
         retry=None,
         timeout=None,
     )
+
+
+def test_to_arrow_readrows_from_job_id(monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pytest.importorskip("google.cloud.bigquery_storage")
+    from google.cloud.bigquery import table as mut
+
+    monkeypatch.setenv("BIGQUERY_READ_ROWS_FROM_JOB_ID", "true")
+
+    schema = pa.schema([("foo", pa.int64())])
+    batch = pa.RecordBatch.from_arrays([pa.array([10, 20, 30])], schema=schema)
+
+    mock_chunk = mock.Mock()
+    mock_chunk.arrow_schema.serialized_schema = schema.serialize().to_pybytes()
+    mock_chunk.arrow_record_batch.serialized_record_batch = (
+        batch.serialize().to_pybytes()
+    )
+
+    mock_read_rows = mock.MagicMock(return_value=[mock_chunk])
+
+    with mock.patch(
+        "google.cloud.bigquery_storage_v1.services.big_query_read.client.BigQueryReadClient.read_rows",
+        mock_read_rows,
+    ):
+        client = _mock_client()
+        bqstorage_client = mock.Mock()
+        client._ensure_bqstorage_client.return_value = bqstorage_client
+
+        row_iterator = mut.RowIterator(
+            client,
+            api_request=None,
+            path=None,
+            schema=[],
+            job_id="job_xyz",
+            location="US",
+            project="test-proj",
+        )
+
+        table = row_iterator.to_arrow()
+        assert table.num_rows == 3
+        assert table.column("foo").to_pylist() == [10, 20, 30]
+
+        mock_read_rows.assert_called_once()
+        _, kwargs = mock_read_rows.call_args
+        request = kwargs["request"]
+        assert (
+            request.read_stream
+            == "projects/test-proj/locations/US/jobs/job_xyz/streams/_default"
+        )
+
+
+def test_to_arrow_readrows_from_job_id_max_results(monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pytest.importorskip("google.cloud.bigquery_storage")
+    from google.cloud.bigquery import table as mut
+
+    monkeypatch.setenv("BIGQUERY_READ_ROWS_FROM_JOB_ID", "1")
+
+    schema = pa.schema([("val", pa.string())])
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(["a", "b", "c", "d", "e"])], schema=schema
+    )
+
+    mock_chunk = mock.Mock()
+    mock_chunk.arrow_schema.serialized_schema = schema.serialize().to_pybytes()
+    mock_chunk.arrow_record_batch.serialized_record_batch = (
+        batch.serialize().to_pybytes()
+    )
+
+    mock_read_rows = mock.MagicMock(return_value=[mock_chunk])
+
+    with mock.patch(
+        "google.cloud.bigquery_storage_v1.services.big_query_read.client.BigQueryReadClient.read_rows",
+        mock_read_rows,
+    ):
+        client = _mock_client()
+        bqstorage_client = mock.Mock()
+        client._ensure_bqstorage_client.return_value = bqstorage_client
+
+        row_iterator = mut.RowIterator(
+            client,
+            api_request=None,
+            path=None,
+            schema=[],
+            job_id="job_slice",
+            location="US",
+            project="test-proj",
+            max_results=3,
+        )
+
+        table = row_iterator.to_arrow()
+        assert table.num_rows == 3
+        assert table.column("val").to_pylist() == ["a", "b", "c"]
+
+
+def test_to_arrow_readrows_from_job_id_missing_storage_lib(monkeypatch):
+    pytest.importorskip("pyarrow")
+    from google.cloud.bigquery import table as mut
+    from google.cloud.bigquery.exceptions import BigQueryStorageNotFoundError
+
+    monkeypatch.setenv("BIGQUERY_READ_ROWS_FROM_JOB_ID", "true")
+
+    client = _mock_client()
+    row_iterator = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=[],
+        job_id="job_err",
+        location="US",
+        project="test-proj",
+    )
+
+    with mock.patch(
+        "google.cloud.bigquery._versions_helpers.BQ_STORAGE_VERSIONS.try_import",
+        side_effect=BigQueryStorageNotFoundError("not found"),
+    ):
+        with pytest.raises(
+            ValueError, match="google-cloud-bigquery-storage is required"
+        ):
+            row_iterator.to_arrow()
+
+
+def test_row_iterator_http_json_pathway_serialized_record_batch():
+    pa = pytest.importorskip("pyarrow")
+    from google.cloud.bigquery import table as mut
+    from google.cloud.bigquery.schema import SchemaField
+
+    schema = pa.schema([("col1", pa.string()), ("col2", pa.int64())])
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(["alpha", "beta"]), pa.array([100, 200])], schema=schema
+    )
+    serialized_batch = batch.serialize().to_pybytes()
+    serialized_schema = schema.serialize().to_pybytes()
+
+    bq_schema = [SchemaField("col1", "STRING"), SchemaField("col2", "INTEGER")]
+    first_page_response = {
+        "serializedRecordBatch": serialized_batch,
+        "serializedSchema": serialized_schema,
+        "totalRows": "2",
+    }
+
+    client = _mock_client()
+    row_iterator = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=bq_schema,
+        first_page_response=first_page_response,
+    )
+
+    # 1. Test row-by-row iteration over HTTP JSON pathway with Arrow response
+    rows = list(row_iterator)
+    assert len(rows) == 2
+    assert rows[0]["col1"] == "alpha"
+    assert rows[0]["col2"] == 100
+    assert rows[1]["col1"] == "beta"
+    assert rows[1]["col2"] == 200
+
+    # 2. Test to_arrow() via HTTP JSON pathway
+    row_iterator_arrow = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=bq_schema,
+        first_page_response=first_page_response,
+    )
+    table = row_iterator_arrow.to_arrow(create_bqstorage_client=False)
+    assert table.num_rows == 2
+    assert table.column("col1").to_pylist() == ["alpha", "beta"]
+    assert table.column("col2").to_pylist() == [100, 200]
+
+    # 3. Test to_dataframe() via HTTP JSON pathway
+    row_iterator_df = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=bq_schema,
+        first_page_response=first_page_response,
+    )
+    df = row_iterator_df.to_dataframe(create_bqstorage_client=False)
+    assert len(df) == 2
+    assert list(df["col1"]) == ["alpha", "beta"]
+    assert list(df["col2"]) == [100, 200]
+
+
+def test_row_iterator_http_json_pathway_base64_ipc_stream():
+    import base64
+
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.ipc as ipc
+    from google.cloud.bigquery import table as mut
+    from google.cloud.bigquery.schema import SchemaField
+
+    schema = pa.schema([("name", pa.string()), ("score", pa.float64())])
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(["Alice", "Bob"]), pa.array([95.5, 88.0])], schema=schema
+    )
+
+    sink = pa.BufferOutputStream()
+    writer = ipc.new_stream(sink, schema)
+    writer.write_batch(batch)
+    writer.close()
+    b64_stream = base64.b64encode(sink.getvalue().to_pybytes()).decode("utf-8")
+
+    bq_schema = [SchemaField("name", "STRING"), SchemaField("score", "FLOAT")]
+    first_page_response = {
+        "serializedRecordBatch": b64_stream,
+        "queryResultsFormat": "ARROW",
+        "totalRows": "2",
+    }
+
+    client = _mock_client()
+    row_iterator = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=bq_schema,
+        first_page_response=first_page_response,
+    )
+
+    # Test to_arrow
+    table = row_iterator.to_arrow(create_bqstorage_client=False)
+    assert table.num_rows == 2
+    assert table.column("name").to_pylist() == ["Alice", "Bob"]
+    assert table.column("score").to_pylist() == [95.5, 88.0]
+
+    # Test row iteration
+    row_iterator_rows = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=bq_schema,
+        first_page_response=first_page_response,
+    )
+    rows = list(row_iterator_rows)
+    assert len(rows) == 2
+    assert rows[0]["name"] == "Alice"
+    assert rows[0][1] == 95.5
+    assert rows[1]["name"] == "Bob"
+    assert rows[1][1] == 88.0

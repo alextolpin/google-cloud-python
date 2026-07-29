@@ -1192,3 +1192,58 @@ def test_wait_or_cancel_exception_raises_original_exception():
         timeout=123,
         retry=retry,
     )
+
+
+def test_query_and_wait_sets_arrow_format_and_compression_when_env_var_set(monkeypatch):
+    monkeypatch.setenv("BIGQUERY_READ_ROWS_FROM_JOB_ID", "true")
+    client = mock.create_autospec(Client)
+    client._call_api.return_value = {
+        "jobReference": {
+            "projectId": "response-project",
+            "jobId": "abc",
+            "location": "response-location",
+        },
+        "jobComplete": True,
+        "totalRows": "0",
+    }
+
+    _job_helpers.query_and_wait(
+        client,
+        query="SELECT 1",
+        location="request-location",
+        project="request-project",
+        job_config=None,
+        retry=lambda f: f,
+        job_retry=None,
+        page_size=None,
+        max_results=None,
+    )
+
+    request_path = "/projects/request-project/queries"
+    client._call_api.assert_called_once_with(
+        None,
+        span_name="BigQuery.query",
+        span_attributes={"path": request_path},
+        method="POST",
+        path=request_path,
+        data={
+            "useLegacySql": False,
+            "formatOptions": {"useInt64Timestamp": True},
+            "location": "request-location",
+            "query": "SELECT 1",
+            "queryResultsFormat": "ARROW",
+            "arrowSerializationOptions": {"bufferCompression": "LZ4_FRAME"},
+            "jobCreationMode": client.default_job_creation_mode,
+            "requestId": mock.ANY,
+        },
+        timeout=None,
+    )
+
+
+def test_supported_by_jobs_query_includes_arrow_serialization_options():
+    request_body = {
+        "query": "SELECT 1",
+        "queryResultsFormat": "ARROW",
+        "arrowSerializationOptions": {"bufferCompression": "LZ4_FRAME"},
+    }
+    assert _job_helpers._supported_by_jobs_query(request_body) is True

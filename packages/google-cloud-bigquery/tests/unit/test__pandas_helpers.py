@@ -2409,3 +2409,72 @@ def test_download_arrow_bqstorage_passes_timeout_to_create_read_session(
     assert retry_policy is not None
     # Check if deadline is set correctly in the retry policy
     assert retry_policy._deadline == timeout
+
+
+@pytest.mark.skipif(isinstance(pyarrow, mock.Mock), reason="Requires `pyarrow`")
+def test_deserialize_arrow_record_batch_stream(module_under_test):
+    import base64
+    import pyarrow.ipc as ipc
+
+    schema = pyarrow.schema([("col_a", pyarrow.int64()), ("col_b", pyarrow.string())])
+    batch = pyarrow.RecordBatch.from_arrays(
+        [pyarrow.array([1, 2, 3]), pyarrow.array(["a", "b", "c"])], schema=schema
+    )
+
+    sink = pyarrow.BufferOutputStream()
+    writer = ipc.new_stream(sink, schema)
+    writer.write_batch(batch)
+    writer.close()
+    b64_stream = base64.b64encode(sink.getvalue().to_pybytes()).decode("utf-8")
+
+    result_batch = module_under_test._deserialize_arrow_record_batch(b64_stream)
+    assert result_batch.num_rows == 3
+    assert result_batch.column("col_a").to_pylist() == [1, 2, 3]
+    assert result_batch.column("col_b").to_pylist() == ["a", "b", "c"]
+
+
+@pytest.mark.skipif(isinstance(pyarrow, mock.Mock), reason="Requires `pyarrow`")
+def test_download_arrow_and_dataframe_row_iterator_record_batch_page(module_under_test):
+    schema = pyarrow.schema([("col_x", pyarrow.int64())])
+    batch = pyarrow.RecordBatch.from_arrays([pyarrow.array([10, 20])], schema=schema)
+
+    mock_page = mock.Mock()
+    mock_page._record_batch = batch
+
+    # download_arrow_row_iterator
+    arrow_results = list(
+        module_under_test.download_arrow_row_iterator([mock_page], bq_schema=[])
+    )
+    assert len(arrow_results) == 1
+    assert arrow_results[0].column("col_x").to_pylist() == [10, 20]
+
+    # download_dataframe_row_iterator
+    if pandas is not None:
+        df_results = list(
+            module_under_test.download_dataframe_row_iterator(
+                [mock_page], bq_schema=[], dtypes={}
+            )
+        )
+        assert len(df_results) == 1
+        assert list(df_results[0]["col_x"]) == [10, 20]
+
+
+@pytest.mark.skipif(isinstance(pyarrow, mock.Mock), reason="Requires `pyarrow`")
+def test_deserialize_arrow_record_batch_multi_batch_stream(module_under_test):
+    import base64
+    import pyarrow.ipc as ipc
+
+    schema = pyarrow.schema([("val", pyarrow.int64())])
+    batch1 = pyarrow.RecordBatch.from_arrays([pyarrow.array([1, 2])], schema=schema)
+    batch2 = pyarrow.RecordBatch.from_arrays([pyarrow.array([3, 4, 5])], schema=schema)
+
+    sink = pyarrow.BufferOutputStream()
+    writer = ipc.new_stream(sink, schema)
+    writer.write_batch(batch1)
+    writer.write_batch(batch2)
+    writer.close()
+    b64_stream = base64.b64encode(sink.getvalue().to_pybytes()).decode("utf-8")
+
+    result_batch = module_under_test._deserialize_arrow_record_batch(b64_stream)
+    assert result_batch.num_rows == 5
+    assert result_batch.column("val").to_pylist() == [1, 2, 3, 4, 5]
