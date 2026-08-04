@@ -29,7 +29,17 @@ import queue
 import threading
 import time
 import warnings
-from typing import Any, Union, Optional, Callable, Generator, List
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 
 
 from google.cloud.bigquery import _pyarrow_helpers
@@ -743,16 +753,17 @@ def _row_iterator_page_to_arrow(page, column_names, arrow_types):
 
 
 def _deserialize_arrow_record_batch(
-    serialized_batch, serialized_schema=None, bq_schema=None
-):
+    serialized_batch: Union[str, bytes],
+    serialized_schema: Optional[Union[str, bytes]] = None,
+    bq_schema: Optional[
+        Sequence[Union["schema.SchemaField", Mapping[str, Any]]]
+    ] = None,
+) -> "pyarrow.RecordBatch":
     """Deserialize base64 or bytes Arrow RecordBatch from BigQuery API response."""
     if pyarrow is None:
         raise ValueError("pyarrow library is required.")
 
-    if isinstance(serialized_batch, str):
-        raw_bytes = base64.b64decode(serialized_batch)
-    else:
-        raw_bytes = bytes(serialized_batch)
+    raw_bytes = base64.b64decode(serialized_batch)
 
     # Try reading as an Arrow IPC stream
     try:
@@ -768,10 +779,7 @@ def _deserialize_arrow_record_batch(
     # Fall back to reading record batch with explicit schema
     pa_schema = None
     if serialized_schema is not None:
-        if isinstance(serialized_schema, str):
-            schema_bytes = base64.b64decode(serialized_schema)
-        else:
-            schema_bytes = bytes(serialized_schema)
+        schema_bytes = base64.b64decode(serialized_schema)
         pa_schema = pyarrow.ipc.read_schema(pyarrow.py_buffer(schema_bytes))
     elif bq_schema is not None:
         pa_schema = bq_to_arrow_schema(bq_schema)
@@ -782,7 +790,11 @@ def _deserialize_arrow_record_batch(
     raise ValueError("Could not deserialize Arrow record batch from response.")
 
 
-def download_arrow_row_iterator(pages, bq_schema, timeout=None):
+def download_arrow_row_iterator(
+    pages: Iterator[Any],
+    bq_schema: Sequence[Union["schema.SchemaField", Mapping[str, Any]]],
+    timeout: Optional[float] = None,
+) -> Iterator["pyarrow.RecordBatch"]:
     """Use HTTP JSON RowIterator to construct an iterable of RecordBatches.
 
     Args:
@@ -805,9 +817,9 @@ def download_arrow_row_iterator(pages, bq_schema, timeout=None):
     column_names = bq_to_arrow_schema(bq_schema) or [field.name for field in bq_schema]
     arrow_types = [bq_to_arrow_data_type(field) for field in bq_schema]
 
-    def _page_to_arrow(page):
-        if getattr(page, "_record_batch", None) is not None:
-            return page._record_batch
+    def _page_to_arrow(page: Any) -> "pyarrow.RecordBatch":
+        if getattr(page, "record_batch", None) is not None:
+            return page.record_batch
         return _row_iterator_page_to_arrow(page, column_names, arrow_types)
 
     if timeout is None:
@@ -837,7 +849,12 @@ def _row_iterator_page_to_dataframe(page, column_names, dtypes):
     return pandas.DataFrame(columns, columns=column_names)
 
 
-def download_dataframe_row_iterator(pages, bq_schema, dtypes, timeout=None):
+def download_dataframe_row_iterator(
+    pages: Iterator[Any],
+    bq_schema: Sequence[Union["schema.SchemaField", Mapping[str, Any]]],
+    dtypes: Mapping[str, Any],
+    timeout: Optional[float] = None,
+) -> Iterator["pandas.DataFrame"]:
     """Use HTTP JSON RowIterator to construct a DataFrame.
 
     Args:
@@ -862,9 +879,9 @@ def download_dataframe_row_iterator(pages, bq_schema, dtypes, timeout=None):
     bq_schema = schema._to_schema_fields(bq_schema)
     column_names = [field.name for field in bq_schema]
 
-    def _page_to_dataframe(page):
-        if getattr(page, "_record_batch", None) is not None:
-            return page._record_batch.to_pandas()
+    def _page_to_dataframe(page: Any) -> "pandas.DataFrame":
+        if getattr(page, "record_batch", None) is not None:
+            return page.record_batch.to_pandas()
         return _row_iterator_page_to_dataframe(page, column_names, dtypes)
 
     if timeout is None:

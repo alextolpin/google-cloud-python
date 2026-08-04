@@ -56,7 +56,7 @@ else:
     _read_wkt = wkt.loads
 
 import google.api_core.exceptions
-from google.api_core.page_iterator import HTTPIterator
+from google.api_core.page_iterator import HTTPIterator, Page
 
 import google.cloud._helpers  # type: ignore
 from google.cloud.bigquery import _helpers
@@ -1835,6 +1835,16 @@ class _NoopProgressBarQueue(object):
         """Don't actually do anything with the item."""
 
 
+class _RowIteratorPage(Page):
+    """A page of results for :class:`RowIterator`."""
+
+    record_batch: Optional["pyarrow.RecordBatch"] = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.record_batch = None
+
+
 class RowIterator(HTTPIterator):
     """A class for iterating through HTTP/JSON API row list responses.
 
@@ -1886,6 +1896,8 @@ class RowIterator(HTTPIterator):
         ended (Optional[datetime.datetime]):
             If representing query results, the end time of the associated query.
     """
+
+    _PAGE_CLS = _RowIteratorPage
 
     def __init__(
         self,
@@ -1945,6 +1957,7 @@ class RowIterator(HTTPIterator):
         self._job_created = created
         self._job_started = started
         self._job_ended = ended
+        self._last_serialized_schema: Optional[str] = None
 
     @property
     def _billing_project(self) -> Optional[str]:
@@ -2050,6 +2063,23 @@ class RowIterator(HTTPIterator):
                 return True
 
         return False
+
+    def _next_page(self) -> Optional[_RowIteratorPage]:
+        """Get the next page in the iterator.
+
+        Returns:
+            Optional[_RowIteratorPage]: The next page in the iterator or None if
+                there are no pages left.
+        """
+        if self._has_next_page():
+            response = self._get_next_page_response()
+            items = response.get(self._items_key, ())
+            page = self._PAGE_CLS(self, items, self.item_to_value, raw_page=response)
+            self._page_start(self, page, response)
+            self.next_page_token = response.get(self._next_token)
+            return page
+        else:
+            return None
 
     def _use_readrows_from_job_id(self) -> bool:
         """Helper to check if BIGQUERY_READ_ROWS_FROM_JOB_ID is enabled and required job properties exist."""
@@ -3983,7 +4013,10 @@ class BigLakeConfiguration(object):
         return copy.deepcopy(self._properties)
 
 
-def _item_to_row(iterator, resource):
+def _item_to_row(
+    iterator: "RowIterator",
+    resource: Union[Dict[str, Any], Tuple[Any, ...], "Row"],
+) -> "Row":
     """Convert a JSON or tuple row to the native object.
 
     .. note::
@@ -4031,7 +4064,11 @@ def _row_iterator_page_columns(schema, response):
 
 
 # pylint: disable=unused-argument
-def _rows_page_start(iterator, page, response):
+def _rows_page_start(
+    iterator: "RowIterator",
+    page: _RowIteratorPage,
+    response: Dict[str, Any],
+) -> None:
     """Grab total rows when :class:`~google.cloud.iterator.Page` starts.
 
     Args:
@@ -4057,7 +4094,7 @@ def _rows_page_start(iterator, page, response):
             serialized_schema=serialized_schema,
             bq_schema=iterator._schema,
         )
-        page._record_batch = record_batch
+        page.record_batch = record_batch
         page._columns = tuple(
             record_batch.column(i).to_pylist() for i in range(record_batch.num_columns)
         )
@@ -4074,7 +4111,7 @@ def _rows_page_start(iterator, page, response):
         page._remaining = len(row_tuples)
         page._item_iter = iter(row_tuples)
     else:
-        page._record_batch = None
+        page.record_batch = None
         page._columns = _row_iterator_page_columns(iterator._schema, response)
 
     total_rows = response.get("totalRows")

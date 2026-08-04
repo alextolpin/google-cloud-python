@@ -2439,7 +2439,7 @@ def test_download_arrow_and_dataframe_row_iterator_record_batch_page(module_unde
     batch = pyarrow.RecordBatch.from_arrays([pyarrow.array([10, 20])], schema=schema)
 
     mock_page = mock.Mock()
-    mock_page._record_batch = batch
+    mock_page.record_batch = batch
 
     # download_arrow_row_iterator
     arrow_results = list(

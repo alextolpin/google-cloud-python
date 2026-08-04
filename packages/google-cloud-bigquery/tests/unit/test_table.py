@@ -7042,6 +7042,7 @@ def test_to_arrow_readrows_from_job_id_missing_storage_lib(monkeypatch):
 
 
 def test_row_iterator_http_json_pathway_serialized_record_batch():
+    import base64
     pa = pytest.importorskip("pyarrow")
     from google.cloud.bigquery import table as mut
     from google.cloud.bigquery.schema import SchemaField
@@ -7050,8 +7051,8 @@ def test_row_iterator_http_json_pathway_serialized_record_batch():
     batch = pa.RecordBatch.from_arrays(
         [pa.array(["alpha", "beta"]), pa.array([100, 200])], schema=schema
     )
-    serialized_batch = batch.serialize().to_pybytes()
-    serialized_schema = schema.serialize().to_pybytes()
+    serialized_batch = base64.b64encode(batch.serialize().to_pybytes())
+    serialized_schema = base64.b64encode(schema.serialize().to_pybytes())
 
     bq_schema = [SchemaField("col1", "STRING"), SchemaField("col2", "INTEGER")]
     first_page_response = {
@@ -7076,6 +7077,19 @@ def test_row_iterator_http_json_pathway_serialized_record_batch():
     assert rows[0]["col2"] == 100
     assert rows[1]["col1"] == "beta"
     assert rows[1]["col2"] == 200
+
+    row_iterator_pages = mut.RowIterator(
+        client,
+        api_request=None,
+        path=None,
+        schema=bq_schema,
+        first_page_response=first_page_response,
+    )
+    pages = list(row_iterator_pages.pages)
+    assert len(pages) == 1
+    assert isinstance(pages[0], mut._RowIteratorPage)
+    assert pages[0].record_batch is not None
+    assert pages[0].record_batch.num_rows == 2
 
     # 2. Test to_arrow() via HTTP JSON pathway
     row_iterator_arrow = mut.RowIterator(
